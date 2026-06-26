@@ -1,0 +1,2636 @@
+---
+title: "TFM_analysis"
+author: "Alejandro Pérez Recio"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Installing and loading the necessary libraries:
+
+```{r}
+# install.packages('readxl')
+# BiocManager::install("GSVA")
+# install.packages('msigdbr')
+library(readxl)
+library(NormalyzerDE)
+library(FactoMineR)
+library(factoextra)
+library(limma)
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+library(GSVA)
+library(msigdbr)
+library(GSEABase)
+library(tidyverse)
+
+library(fgsea)
+
+library(decoupleR)
+library(dorothea)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+library(mygene)
+
+library(EnhancedVolcano)
+library(ggrepel)
+```
+
+Loading the dataset:
+
+```{r}
+prots_df <- read_excel("20260413_112142_Glioblastoma y RAD52_Report.xlsx",
+                       na = c("", "NaN", "NA"))
+head(prots_df)
+```
+
+Protein groups are aggregated at the gene level by averaging intensities for proteins mapping to the same gene, to enable compatibility with gene set–based pathway analysis.
+
+We will also separate the samples into two different dataframes to normalyze them separately (stem-like and differentiated) because of the big proteomic differences between these two cell lines.
+
+We will filter out those proteins with a high proportion of NA values. However, we should be careful with the filter, since NA values often derive from low protein quantity, and might be biologically relevant (for example, if the NA values for one protein are mostly in one condition, it is most probably due to that condition having low quantity of that protein, which is informative and relevant, and should not be simply discarded).
+
+Next, we will impute data using Limit of Detection (LoD), using half of the minimum value per protein.
+
+We use a boxplot to represent the global distribution of gene expression in the different samples and check for the presence of noise.
+
+```{r}
+# Since we will be working with the PG.Genes IDs, and some proteins in the DF
+# share the same PG.Gene (they are isoforms, splice variants, etc.) we will
+# collapse the proteins belonging to the same gene into one, using the mean
+# expression
+
+df_collapsed <- prots_df %>%
+  dplyr::group_by(PG.Genes) %>%
+  dplyr::summarise(across(where(is.numeric), mean))
+
+protein_ids <- df_collapsed$PG.Genes
+
+# The original DF contains other data and the replicates are not in adjacent columns.
+prots_df_ordered <- data.frame(df_collapsed[2],df_collapsed[6],df_collapsed[10],df_collapsed[14],
+                               df_collapsed[3],df_collapsed[7],df_collapsed[11],df_collapsed[15],
+                               df_collapsed[4],df_collapsed[8],df_collapsed[12],df_collapsed[16],
+                               df_collapsed[5],df_collapsed[9],df_collapsed[13],df_collapsed[17]
+                               )
+
+# One of the proteins (Q6ZSR9) has no PG.Gene associated with it (It is encoded
+# in the 3'-UTR of AAK1 but there is evidence for the existence of the protein
+# from a number of proteomics studies). We will remove this protein for this
+# study as we will not be able to map it to a gene. It is located as the last
+# row of the data.
+
+prots_df_ordered <- prots_df_ordered[-nrow(prots_df_ordered), ]
+protein_ids <- protein_ids[-length(protein_ids)]
+
+rownames(prots_df_ordered) <- protein_ids
+colnames(prots_df_ordered) <- c('shNT_DIFF_1','shNT_DIFF_2','shNT_DIFF_3','shNT_DIFF_4',
+                                'shNT_STEM_1','shNT_STEM_2','shNT_STEM_3','shNT_STEM_4',
+                                'shRAD52_DIFF_1','shRAD52_DIFF_2','shRAD52_DIFF_3','shRAD52_DIFF_4',
+                                'shRAD52_STEM_1','shRAD52_STEM_2','shRAD52_STEM_3','shRAD52_STEM_4')
+
+# Separate into 2 different dataframes for the two cell tzpes
+prots_DIFF <- data.frame(prots_df_ordered[1],prots_df_ordered[2],prots_df_ordered[3],prots_df_ordered[4],
+                         prots_df_ordered[9],prots_df_ordered[10],prots_df_ordered[11],prots_df_ordered[12])
+
+prots_STEM <- data.frame(prots_df_ordered[5],prots_df_ordered[6],prots_df_ordered[7],prots_df_ordered[8],
+                         prots_df_ordered[13],prots_df_ordered[14],prots_df_ordered[15],prots_df_ordered[16])
+
+# Filter to keep only those proteins with at least half of non-NA values
+prots_DIFF <- prots_DIFF[which(rowMeans(!is.na(prots_DIFF)) > 0.7), ]
+prots_STEM <- prots_STEM[which(rowMeans(!is.na(prots_STEM)) > 0.7), ]
+prots_all <- prots_df_ordered[which(rowMeans(!is.na(prots_STEM)) > 0.7), ]
+
+# Create protein IDs vectors again with the proteins filtered in each group
+protein_ids_DIFF <- rownames(prots_DIFF)
+protein_ids_STEM <- rownames(prots_STEM)
+protein_ids_all <- rownames(prots_all)
+
+# Quick function to impute NAs with LoD/5
+
+lod5_impute <- function(mat) {
+  
+  imputed_mat <- t(apply(mat, 1, function(row) {
+   
+     # Lowest detected value for this protein
+    lod <- min(row, na.rm = TRUE)
+    
+    # Replace NAs with LoD/5
+    row[is.na(row)] <- lod / 5
+    
+    return(row)
+  }))
+  
+  # Preserve row/column names
+  rownames(imputed_mat) <- rownames(mat)
+  colnames(imputed_mat) <- colnames(mat)
+  
+  return(imputed_mat)
+}
+
+prots_DIFF <- as.data.frame(lod5_impute(prots_DIFF))
+prots_STEM <- as.data.frame(lod5_impute(prots_STEM))
+prots_all <- as.data.frame(lod5_impute(prots_all))
+
+boxplot(prots_DIFF,outline=F,las=2,ylab="Protein Quantification (Differentiated)")
+boxplot(prots_STEM,outline=F,las=2,ylab="Protein Quantification (Stem-like")
+```
+
+Variations between replicates of the same conditions show the presence of noise. We will use NormalyzerDE to choose the best normalization technique.
+
+```{r}
+## A data frame needs to be generated to specify the experimental design.
+design_DIFF <- data.frame(sample=colnames(prots_DIFF),
+                     group=c(rep("shNT_DIFF",4),rep("shRAD52_DIFF",4)))
+
+design_STEM <- data.frame(sample=colnames(prots_STEM),
+                     group=c(rep("shNT_STEM",4),rep("shRAD52_STEM",4)))
+
+design_all <- data.frame(sample=colnames(prots_df_ordered),
+                     group=c(rep("shNT_DIFF",4),
+                             rep("shNT_STEM",4),
+                             rep("shRAD52_DIFF",4),
+                             rep("shRAD52_STEM",4)))
+
+## The experimental design needs to be saved to a file.
+write.table(x = design_DIFF, file = "normalyzer_design_DIFF.tsv",quote = F,
+            row.names = F, sep = "\t")
+write.table(x = design_STEM, file = "normalyzer_design_STEM.tsv",quote = F,
+            row.names = F, sep = "\t")
+write.table(x = design_all, file = "normalyzer_design_all.tsv",quote = F,
+            row.names = F, sep = "\t")
+
+# A table with the raw data is also saved. The values are increased +1 to make
+# sure that all values are above 1, so that we can apply log transformations.
+prots_DIFF_1 <- prots_DIFF + 1
+write.table(x = prots_DIFF_1, file = "prots_DIFF.tsv", quote = F,
+            row.names = F, sep = "\t")
+
+prots_STEM_1 <- prots_STEM + 1
+write.table(x = prots_STEM_1, file = "prots_STEM.tsv", quote = F,
+            row.names = F, sep = "\t")
+
+prots_all_1 <- prots_all + 1
+write.table(x = prots_all_1, file = "prots_all.tsv", quote = F,
+            row.names = F, sep = "\t")
+
+## The following function runs all normalization techniques and generates
+## evaluations measures for them. 
+normalyzer(jobName = "prots_diff",designPath = "normalyzer_design_DIFF.tsv",
+           dataPath = "prots_DIFF.tsv",outputDir = ".")
+
+normalyzer(jobName = "prots_stem",designPath = "normalyzer_design_STEM.tsv",
+           dataPath = "prots_STEM.tsv",outputDir = ".")
+
+normalyzer(jobName = "prots_all",designPath = "normalyzer_design_all.tsv",
+           dataPath = "prots_all.tsv",outputDir = ".")
+```
+
+We will pick Variance Stabilizing Normalization (VSN), as it seems to be reducing intragroup variance the best.
+
+```{r}
+normalized_prot_DIFF <- read.table(file="prots_diff/VSN-normalized.txt", header=T)
+rownames(normalized_prot_DIFF) <- protein_ids_DIFF
+boxplot(normalized_prot_DIFF,outline=F,las=2,ylab="Normalized Protein Quantification (Differentiated)")
+
+normalized_prot_STEM <- read.table(file="prots_stem/VSN-normalized.txt", header=T)
+rownames(normalized_prot_STEM) <- protein_ids_STEM
+boxplot(normalized_prot_STEM,outline=F,las=2,ylab="Normalized Protein Quantification (Stem-like)")
+
+normalized_protein <- read.table(file="prots_all/VSN-normalized.txt", header=T)
+rownames(normalized_protein) <- protein_ids_all
+boxplot(normalized_protein,outline=F,las=2,ylab="Normalized Protein Quantification (Stem-like)")
+```
+
+We can represent two different replicates in a scatter plot to check that they are mostly similar:
+
+```{r}
+plot(x = normalized_prot_DIFF$shNT_DIFF_1,
+     y = normalized_prot_DIFF$shNT_DIFF_2,
+     pch=19,col="grey",xlab="shNT_DIFF_1",ylab="shNT_DIFF_2",cex=0.5)
+text(x=4,y=12,
+     labels = paste(c(
+      "cor = ",
+      round(100*cor(normalized_prot_DIFF$shNT_DIFF_1,
+                    normalized_prot_DIFF$shNT_DIFF_2),
+            digits = 2),
+      "%"), collapse=""))
+```
+
+We will analyze the data with Principal Component Analysis (PCA) in order to verify that no mistakes were made in labeling the samples and that samples with similar biological conditions cluster together as expected.
+
+```{r}
+# TransSTEMing the df for the function to work
+pca_prot_diff <- data.frame(colnames(normalized_prot_DIFF),
+                                  t(normalized_prot_DIFF))
+colnames(pca_prot_diff)[1] <- "Sample"
+pca_prot_diff[1:8][1:6]
+
+res_pca_diff <- PCA(pca_prot_diff, 
+               graph = FALSE,
+               scale.unit = TRUE,
+               quali.sup = 1 )
+
+fviz_pca_ind(res_pca_diff, col.ind = design_DIFF$group, 
+             pointsize=2, pointshape=21,fill="black",
+             repel = TRUE, 
+             addEllipses = TRUE,ellipse.type = "confidence",
+             legend.title="Conditions",
+             title="",
+             show_legend=TRUE,show_guide=TRUE)
+
+
+pca_prot_stem <- data.frame(colnames(normalized_prot_STEM),
+                                  t(normalized_prot_STEM))
+colnames(pca_prot_stem)[1] <- "Sample"
+pca_prot_stem[1:8][1:6]
+
+res_pca_stem <- PCA(pca_prot_stem, 
+               graph = FALSE,
+               scale.unit = TRUE,
+               quali.sup = 1 )
+
+fviz_pca_ind(res_pca_stem, col.ind = design_STEM$group, 
+             pointsize=2, pointshape=21,fill="black",
+             repel = TRUE, 
+             addEllipses = TRUE,ellipse.type = "confidence",
+             legend.title="Conditions",
+             title="",
+             show_legend=TRUE,show_guide=TRUE)
+```
+
+The differences between cells with the Non-target short hairpin interference RNA (shNT) and the ones with target interference RNA against RAD52 (shRAD52) are clearly seen in DIFF (Glioblastoma Differentiated Cells), but not so much for the STEM (Glioblastoma Stem Cells).
+
+We can also perform hierarchical clustering analysis over the PCA results and represent it in a dendrogram to check that the different conditions group up together as expected.
+
+```{r}
+res_hcpc_diff <- HCPC(res_pca_diff, graph=FALSE, nb.clust = 4)   
+
+fviz_dend(res_hcpc_diff,k=4,
+          cex = 0.75,                       # Label size
+          palette = "jco",               # Color palette see ?ggpubr::ggpar
+          rect = TRUE, rect_fill = TRUE, # Add rectangle around groups
+          rect_border = "jco",           # Rectangle color
+          type="rectangle",
+          labels_track_height = 700      # Augment the room for labels
+)
+
+res_pca_stem <- HCPC(res_pca_stem, graph=FALSE,nb.clust = 4)   
+
+fviz_dend(res_pca_stem,k=4,
+          cex = 0.75,                       # Label size
+          palette = "jco",               # Color palette see ?ggpubr::ggpar
+          rect = TRUE, rect_fill = TRUE, # Add rectangle around groups
+          rect_border = "jco",           # Rectangle color
+          type="rectangle",
+          labels_track_height = 700      # Augment the room for labels
+)
+```
+
+As we saw in the PCA, the sampls for STEM cells are very similar and the hierarchical clustering cannot differentiate between those with and without shRAD52. In the DIFF cells, the clustering differentiates better between the two conditions, but still mixes up some of the samples.
+
+## DEGs
+
+Differential expression analysis with limma:
+
+### Individual limma contrasts
+
+EXPERIMENTAL: Contrastes individualmente, por separado en diferentes diseños, y usando pvalor en lugar de ajustado:
+
+```{r}
+intersect_proteins <- intersect(rownames(normalized_prot_DIFF), rownames(normalized_prot_STEM))
+
+experimental_design_diff <- model.matrix(~ -1+factor(c(1,1,1,1,2,2,2,2)))
+colnames(experimental_design_diff) <- c("shNT_DIFF","shRAD52_DIFF")
+experimental_design_stem <- model.matrix(~ -1+factor(c(1,1,1,1,2,2,2,2)))
+colnames(experimental_design_stem) <- c("shNT_STEM","shRAD52_STEM")
+
+normalized_prot_DIFF <- normalized_prot_DIFF[intersect_proteins,]
+
+## Linear model fit to the experimental design, mean expression calculation
+linear_fit_diff <- lmFit(normalized_prot_DIFF, experimental_design_diff)
+linear_fit_stem <- lmFit(normalized_prot_STEM, experimental_design_stem)
+
+## Contrast specification treatment-control
+contrast_matrix_diff <- makeContrasts(shRAD52_DIFF-shNT_DIFF,
+                                 levels=c("shNT_DIFF","shRAD52_DIFF"))
+contrast_matrix_stem <- makeContrasts(shRAD52_STEM-shNT_STEM,
+                                 levels=c("shNT_STEM","shRAD52_STEM"))
+
+contrast_linear_fit_diff <- contrasts.fit(linear_fit_diff, contrast_matrix_diff)
+contrast_results_diff <- eBayes(contrast_linear_fit_diff)
+contrast_linear_fit_stem <- contrasts.fit(linear_fit_stem, contrast_matrix_stem)
+contrast_results_stem <- eBayes(contrast_linear_fit_stem)
+```
+
+```{r}
+## Results extraction for the first contrast (shRAD52_DIFF.shNT_DIFF) sorted according to logFC
+shRAD52_DIFF.shNT_DIFF <- topTable(contrast_results_diff, 
+                      number=nrow(normalized_prot_DIFF),
+                      coef=1,
+                      sort.by="logFC")
+head(shRAD52_DIFF.shNT_DIFF)
+
+## DEGs extraction
+limma.log2fc <- shRAD52_DIFF.shNT_DIFF$logFC
+limma.adjusted.pval <- shRAD52_DIFF.shNT_DIFF$adj.P.Val 
+limma.pval <- shRAD52_DIFF.shNT_DIFF$P.Value 
+limma.protein_ids <- rownames(shRAD52_DIFF.shNT_DIFF)
+
+names(limma.log2fc) <- limma.protein_ids
+names(limma.adjusted.pval) <- limma.protein_ids
+names(limma.pval) <- limma.protein_ids
+
+shRAD52_DIFF.shNT_DIFF.activated.genes <- limma.protein_ids[limma.log2fc > 0 & 
+                                          limma.pval < 0.01]
+shRAD52_DIFF.shNT_DIFF.repressed.genes <- limma.protein_ids[limma.log2fc < 0 & 
+                                          limma.pval < 0.01]
+length(shRAD52_DIFF.shNT_DIFF.activated.genes)
+length(shRAD52_DIFF.shNT_DIFF.repressed.genes)
+
+## Volcano plot
+volcano_df <- data.frame(
+  logFC = limma.log2fc,
+  pval = limma.pval
+)
+
+volcano_df$negLogP <- -log10(volcano_df$pval)
+volcano_df$gene <- rownames(volcano_df)
+
+volcano_df$group <- "NS"
+volcano_df$group[volcano_df$gene %in% shRAD52_DIFF.shNT_DIFF.activated.genes] <- "Up"
+volcano_df$group[volcano_df$gene %in% shRAD52_DIFF.shNT_DIFF.repressed.genes] <- "Down"
+
+# pick top genes for labeling (by significance)
+top_genes <- volcano_df[order(volcano_df$pval), ][1:10, ]
+max_fc <- max(abs(volcano_df$logFC), na.rm = TRUE) * 1.05
+
+volcano <- ggplot(volcano_df, aes(x = logFC, y = negLogP)) +
+
+  # background points (neutral grey, transparent)
+  geom_point(
+    color = "grey75",
+    alpha = 0.6,
+    size = 1.3
+  ) +
+
+  # highlighted groups
+  geom_point(
+    data = subset(volcano_df, group == "Up"),
+    color = "#2C7BB6",
+    alpha = 0.85,
+    size = 1.5
+  ) +
+  geom_point(
+    data = subset(volcano_df, group == "Down"),
+    color = "#D7191C",
+    alpha = 0.85,
+    size = 1.5
+  ) +
+
+  # threshold lines (subtle, not distracting)
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "grey60") +
+
+  # label only top genes
+  geom_text_repel(
+    data = top_genes,
+    aes(label = gene),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    segment.color = "grey50"
+  ) +
+
+  # axis + theme styling (this is what makes it “Nature-like”)
+  labs(
+    x = "log2 fold change",
+    y = expression(-log[10]("p-value"))
+  ) +
+  
+  coord_cartesian(xlim = c(-max_fc, max_fc),
+                  ylim = c(0,6.5)) +
+
+  theme_classic(base_size = 14) +
+  theme(
+
+    # remove minor clutter
+    axis.line = element_line(color = "black", linewidth = 0.6),
+    axis.ticks = element_line(color = "black"),
+
+    # cleaner axis text
+    axis.text = element_text(color = "black"),
+
+    # no grid anywhere (very important for journal look)
+    panel.grid = element_blank(),
+
+    # slightly stronger axis titles
+    axis.title = element_text(face = "bold"),
+
+    # tight margins (optional but very “paper-like”)
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave("volcano_RAD52DIFF.svg", plot = volcano, width = 6, height = 6)
+
+################################ STEM RAD52 vs NT #########################
+
+## Results extraction for the second contrast (shRAD52_STEM.shNT_STEM) sorted according to logFC
+shRAD52_STEM.shNT_STEM <- topTable(contrast_results_stem, 
+                      number=nrow(normalized_prot_STEM),
+                      coef=1,
+                      sort.by="logFC")
+head(shRAD52_STEM.shNT_STEM)
+
+## DEGs extraction
+limma.log2fc <- shRAD52_STEM.shNT_STEM$logFC
+limma.adjusted.pval <- shRAD52_STEM.shNT_STEM$adj.P.Val 
+limma.pval <- shRAD52_STEM.shNT_STEM$P.Value 
+limma.protein_ids <- rownames(shRAD52_STEM.shNT_STEM)
+
+names(limma.log2fc) <- limma.protein_ids
+names(limma.adjusted.pval) <- limma.protein_ids
+names(limma.pval) <- limma.protein_ids
+
+shRAD52_STEM.shNT_STEM.activated.genes <- limma.protein_ids[limma.log2fc > 0 & 
+                                          limma.pval < 0.01]
+shRAD52_STEM.shNT_STEM.repressed.genes <- limma.protein_ids[limma.log2fc < 0 & 
+                                          limma.pval < 0.01]
+length(shRAD52_STEM.shNT_STEM.activated.genes)
+length(shRAD52_STEM.shNT_STEM.repressed.genes)
+
+## Volcano plot
+volcano_df <- data.frame(
+  logFC = limma.log2fc,
+  pval = limma.pval
+)
+
+volcano_df$negLogP <- -log10(volcano_df$pval)
+volcano_df$gene <- rownames(volcano_df)
+
+volcano_df$group <- "NS"
+volcano_df$group[volcano_df$gene %in% shRAD52_STEM.shNT_STEM.activated.genes] <- "Up"
+volcano_df$group[volcano_df$gene %in% shRAD52_STEM.shNT_STEM.repressed.genes] <- "Down"
+
+# pick top genes for labeling (by significance)
+top_genes <- volcano_df[order(volcano_df$pval), ][1:10, ]
+max_fc <- max(abs(volcano_df$logFC), na.rm = TRUE) * 1.05
+
+volcano <- ggplot(volcano_df, aes(x = logFC, y = negLogP)) +
+
+  # background points (neutral grey, transparent)
+  geom_point(
+    color = "grey75",
+    alpha = 0.6,
+    size = 1.3
+  ) +
+
+  # highlighted groups
+  geom_point(
+    data = subset(volcano_df, group == "Up"),
+    color = "#2C7BB6",
+    alpha = 0.85,
+    size = 1.5
+  ) +
+  geom_point(
+    data = subset(volcano_df, group == "Down"),
+    color = "#D7191C",
+    alpha = 0.85,
+    size = 1.5
+  ) +
+
+  # threshold lines (subtle, not distracting)
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "grey60") +
+
+  # label only top genes
+  geom_text_repel(
+    data = top_genes,
+    aes(label = gene),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    segment.color = "grey50"
+  ) +
+
+  # axis + theme styling (this is what makes it “Nature-like”)
+  labs(
+    x = "log2 fold change",
+    y = expression(-log[10]("p-value"))
+  ) +
+  
+  coord_cartesian(xlim = c(-max_fc, max_fc)) +
+
+  theme_classic(base_size = 14) +
+  theme(
+
+    # remove minor clutter
+    axis.line = element_line(color = "black", linewidth = 0.6),
+    axis.ticks = element_line(color = "black"),
+
+    # cleaner axis text
+    axis.text = element_text(color = "black"),
+
+    # no grid anywhere (very important for journal look)
+    panel.grid = element_blank(),
+
+    # slightly stronger axis titles
+    axis.title = element_text(face = "bold"),
+
+    # tight margins (optional but very “paper-like”)
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave("volcano_RAD52STEM.svg", plot = volcano, width = 6, height = 6)
+```
+
+### Grouped limma analysis
+
+```{r}
+## Experimental design specification
+
+## Experimental design specification
+experimental.design <- model.matrix(~ -1+factor(c(1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4)))
+colnames(experimental.design) <- c("shNT_DIFF","shNT_STEM","shRAD52_DIFF","shRAD52_STEM")
+
+## Linear model fit to the experimental design, mean expression calculation
+linear.fit <- lmFit(normalized_protein, experimental.design)
+
+## Contrast specification treatment-control
+contrast.matrix <- makeContrasts(shRAD52_DIFF-shNT_DIFF,shRAD52_STEM-shNT_STEM,shRAD52_STEM-shRAD52_DIFF,shNT_STEM-shNT_DIFF,
+                                 levels=c("shNT_DIFF","shNT_STEM","shRAD52_DIFF","shRAD52_STEM"))
+
+contrast.linear.fit <- contrasts.fit(linear.fit, contrast.matrix)
+contrast.results <- eBayes(contrast.linear.fit, robust = TRUE)
+# Trying with robust=TRUE to try and make it less sensible to variance imbalance
+
+```
+
+Fourth contrast: shNT_STEM vs shNT_DIFF.
+
+```{r}
+## Results extraction for the fourth contrast (coef=4) sorted according to logFC
+shNT_STEM.shNT_DIFF <- topTable(contrast.results, 
+                      number=nrow(normalized_protein),
+                      coef=4,
+                      sort.by="logFC")
+head(shNT_STEM.shNT_DIFF)
+
+## DEGs extraction
+limma.log2fc <- shNT_STEM.shNT_DIFF$logFC
+limma.adjusted.pval <- shNT_STEM.shNT_DIFF$adj.P.Val
+limma.pval <- shNT_STEM.shNT_DIFF$P.Value 
+limma.protein_ids <- rownames(shNT_STEM.shNT_DIFF)
+
+names(limma.log2fc) <- limma.protein_ids
+names(limma.adjusted.pval) <- limma.protein_ids
+names(limma.pval) <- limma.protein_ids
+
+shNT_STEM.shNT_DIFF.activated.genes <- limma.protein_ids[limma.log2fc > 0.58 & 
+                                          limma.adjusted.pval < 0.01]
+shNT_STEM.shNT_DIFF.repressed.genes <- limma.protein_ids[limma.log2fc < - 0.58 & 
+                                          limma.adjusted.pval < 0.01]
+length(shNT_STEM.shNT_DIFF.activated.genes)
+length(shNT_STEM.shNT_DIFF.repressed.genes)
+
+## Volcano plot
+volcano_df <- data.frame(
+  logFC = limma.log2fc,
+  padj = limma.adjusted.pval
+)
+
+volcano_df$negLogP <- -log10(volcano_df$padj)
+volcano_df$gene <- rownames(volcano_df)
+
+volcano_df$group <- "NS"
+volcano_df$group[volcano_df$gene %in% shNT_STEM.shNT_DIFF.activated.genes] <- "Up"
+volcano_df$group[volcano_df$gene %in% shNT_STEM.shNT_DIFF.repressed.genes] <- "Down"
+
+# pick top genes for labeling (by significance)
+top_genes <- volcano_df[order(volcano_df$padj), ][1:10, ]
+max_fc <- max(abs(volcano_df$logFC), na.rm = TRUE) * 1.05
+
+volcano <- ggplot(volcano_df, aes(x = logFC, y = negLogP)) +
+
+  # background points (neutral grey, transparent)
+  geom_point(
+    color = "grey75",
+    alpha = 0.6,
+    size = 1.3
+  ) +
+
+  # highlighted groups
+  geom_point(
+    data = subset(volcano_df, group == "Up"),
+    color = "#2C7BB6",
+    alpha = 0.85,
+    size = 1.5
+  ) +
+  geom_point(
+    data = subset(volcano_df, group == "Down"),
+    color = "#D7191C",
+    alpha = 0.85,
+    size = 1.5
+  ) +
+
+  # threshold lines (subtle, not distracting)
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey60") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed", color = "grey60") +
+
+  # label only top genes
+  geom_text_repel(
+    data = top_genes,
+    aes(label = gene),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    segment.color = "grey50"
+  ) +
+
+  # axis + theme styling (this is what makes it “Nature-like”)
+  labs(
+    x = "log2 fold change",
+    y = expression(-log[10]("adjusted p-value"))
+  ) +
+  
+  coord_cartesian(xlim = c(-max_fc, max_fc)) +
+
+  theme_classic(base_size = 14) +
+  theme(
+
+    # remove minor clutter
+    axis.line = element_line(color = "black", linewidth = 0.6),
+    axis.ticks = element_line(color = "black"),
+
+    # cleaner axis text
+    axis.text = element_text(color = "black"),
+
+    # no grid anywhere (very important for journal look)
+    panel.grid = element_blank(),
+
+    # slightly stronger axis titles
+    axis.title = element_text(face = "bold"),
+
+    # tight margins (optional but very “paper-like”)
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+ggsave("volcano_STEMDIFF.svg", plot = volcano, width = 6, height = 6)
+```
+
+### Interaction test
+
+Essentially answering the question: which proteins change in STEM cells after adding RAD52 that do not change in DIFF cells after RAD52 addition?
+
+```{r}
+CellType <- factor(c(
+  rep("DIFF", 8),
+  rep("STEM", 8)))
+
+Knockdown <- factor(c(
+  rep("shNT", 4),
+  rep("shRAD52", 4),
+  rep("shNT", 4),
+  rep("shRAD52", 4)))
+
+design <- model.matrix(~0 + CellType:Knockdown)
+colnames(design) <- c(
+  "DIFF_shNT",
+  "STEM_shNT",
+  "DIFF_shRAD52",
+  "STEM_shRAD52")
+
+cont <- makeContrasts(
+  RAD52_DIFF = DIFF_shRAD52 - DIFF_shNT,
+  RAD52_STEM = STEM_shRAD52 - STEM_shNT,
+  Interaction =
+    (STEM_shRAD52 - STEM_shNT) -
+    (DIFF_shRAD52 - DIFF_shNT),
+  levels = design)
+
+fit <- lmFit(normalized_protein, design)
+fit <- contrasts.fit(fit, cont)
+fit <- eBayes(fit)
+
+interaction.contrast <- topTable(fit, 
+                      number=nrow(normalized_protein),
+                      coef="Interaction",
+                      sort.by="logFC")
+
+## DEGs extraction
+limma.log2fc <- interaction.contrast$logFC
+limma.adjusted.pval <- interaction.contrast$adj.P.Val
+limma.pval <- interaction.contrast$P.Value
+limma.protein_ids <- rownames(interaction.contrast)
+
+names(limma.log2fc) <- limma.protein_ids
+names(limma.adjusted.pval) <- limma.protein_ids
+names(limma.pval) <- limma.protein_ids
+
+interaction.contrast.activated.genes <- limma.protein_ids[limma.log2fc > 0.58 & 
+                                          limma.pval < 0.01]
+interaction.contrast.repressed.genes <- limma.protein_ids[limma.log2fc < - 0.58 & 
+                                          limma.pval < 0.01]
+length(interaction.contrast.activated.genes)
+length(interaction.contrast.repressed.genes)
+
+## Volcano plot
+log.limma.adjusted.pval <- -log10(limma.pval)
+plot(limma.log2fc,log.limma.adjusted.pval,pch=19,col="grey",cex=0.8,
+     xlim=c(-6,6),ylim = c(0,10), 
+     xlab="log2(Fold-chage)",ylab="-log10(p-val)",cex.lab=1.5)
+
+points(x = limma.log2fc[interaction.contrast.activated.genes],
+       y = log.limma.adjusted.pval[interaction.contrast.activated.genes],col="blue",cex=0.8,pch=19)
+points(x = limma.log2fc[interaction.contrast.repressed.genes],
+       y = log.limma.adjusted.pval[interaction.contrast.repressed.genes],col="red",cex=0.8,pch=19)
+```
+
+## Enrichment
+
+### GO Enrichment
+
+With the first comparison shRAD52_DIFF vs shNT_DIFF (activated and repressed genes). Even with a pvalueCutoff of 0.1, there are almost no enriched terms (there are 2 of them in the repressed genes, related to mithocondrial membrane)
+
+```{r}
+activated.enrich.go.shRAD52_DIFF.shNT_DIFF <- enrichGO(gene = shRAD52_DIFF.shNT_DIFF.activated.genes,
+                                OrgDb         = org.Hs.eg.db,
+                                ont           = "BP",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff  = 0.1,
+                                readable      = FALSE,
+                                keyType = "SYMBOL")
+
+dotplot(activated.enrich.go.shRAD52_DIFF.shNT_DIFF)
+#treeplot(pairwise_termsim(activated.enrich.go.shRAD52_DIFF.shNT_DIFF),showCategory = 20)
+
+repressed.enrich.go.shRAD52_DIFF.shNT_DIFF <- enrichGO(gene = shRAD52_DIFF.shNT_DIFF.repressed.genes,
+                                OrgDb         = org.Hs.eg.db,
+                                ont           = "BP",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff  = 0.1,
+                                readable      = FALSE,
+                                keyType = "SYMBOL")
+
+dotplot(repressed.enrich.go.shRAD52_DIFF.shNT_DIFF)
+#treeplot(pairwise_termsim(repressed.enrich.go.shRAD52_DIFF.shNT_DIFF),showCategory = 20)
+
+```
+
+Now, for shRAD52_STEM vs shNT_STEM
+
+```{r}
+activated.enrich.go.shRAD52_STEM.shNT_STEM <- enrichGO(gene = shRAD52_STEM.shNT_STEM.activated.genes,
+                                OrgDb         = org.Hs.eg.db,
+                                ont           = "BP",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff  = 0.1,
+                                readable      = FALSE,
+                                keyType = "SYMBOL")
+
+dotplot(activated.enrich.go.shRAD52_STEM.shNT_STEM)
+#treeplot(pairwise_termsim(activated.enrich.go.shRAD52_DIFF.shNT_DIFF),showCategory = 20)
+
+repressed.enrich.go.shRAD52_STEM.shNT_STEM <- enrichGO(gene = shRAD52_STEM.shNT_STEM.repressed.genes,
+                                OrgDb         = org.Hs.eg.db,
+                                ont           = "BP",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff  = 0.1,
+                                readable      = FALSE,
+                                keyType = "SYMBOL")
+
+dotplot(repressed.enrich.go.shRAD52_STEM.shNT_STEM)
+#treeplot(pairwise_termsim(repressed.enrich.go.shRAD52_DIFF.shNT_DIFF),showCategory = 20)
+```
+
+And again with shNT_STEM vs shNT_DIFF:
+
+```{r}
+activated.enrich.go.shNT_STEM.shNT_DIFF <- enrichGO(gene = shNT_STEM.shNT_DIFF.activated.genes,
+                                OrgDb         = org.Hs.eg.db,
+                                ont           = "BP",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff  = 0.5,
+                                readable      = FALSE,
+                                keyType = "SYMBOL")
+
+dotplot(activated.enrich.go.shNT_STEM.shNT_DIFF)
+#treeplot(pairwise_termsim(activated.enrich.go.shNT_STEM.shNT_DIFF),showCategory = 20)
+#barplot(activated.enrich.go.shNT_STEM.shNT_DIFF, showCategory = 20)
+
+repressed.enrich.go.shNT_STEM.shNT_DIFF <- enrichGO(gene = shNT_STEM.shNT_DIFF.repressed.genes,
+                                OrgDb         = org.Hs.eg.db,
+                                ont           = "BP",
+                                pAdjustMethod = "BH",
+                                pvalueCutoff  = 0.5,
+                                readable      = FALSE,
+                                keyType = "SYMBOL")
+
+dotplot(repressed.enrich.go.shNT_STEM.shNT_DIFF)
+treeplot(pairwise_termsim(repressed.enrich.go.shNT_STEM.shNT_DIFF),showCategory = 20)
+barplot(repressed.enrich.go.shNT_STEM.shNT_DIFF, showCategory = 20)
+```
+
+### KEGGs
+
+Now, we will try to obtain enriched KEGG pathways for the shRAD52_DIFF-shNT_DIFF comparison:
+
+```{r}
+activated.df <- bitr(
+    shRAD52_DIFF.shNT_DIFF.activated.genes,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+repressed.df <- bitr(
+    shRAD52_DIFF.shNT_DIFF.repressed.genes,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+universe.df <- bitr(
+    protein_ids,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+activated.enrich.kegg.shRAD52_DIFF.shNT_DIFF <- enrichKEGG(
+    gene = activated.df$ENTREZID,
+    universe = universe.df$ENTREZID,
+    organism = "hsa",
+    pvalueCutoff  = 1)
+
+res <- activated.enrich.kegg.shRAD52_DIFF.shNT_DIFF@result
+
+res <- res[order(res$pvalue), ]
+head(res[, c("Description", "Count", "pvalue", "p.adjust")], 15)
+
+repressed.enrich.kegg.shRAD52_DIFF.shNT_DIFF <- enrichKEGG(
+    gene = repressed.df$ENTREZID,
+    universe = universe.df$ENTREZID,
+    organism = "hsa",
+    pvalueCutoff  = 1)
+
+res <- repressed.enrich.kegg.shRAD52_DIFF.shNT_DIFF@result
+
+res <- res[order(res$pvalue), ]
+head(res[, c("Description", "Count", "pvalue", "p.adjust")], 15)
+```
+
+For the shRAD52_STEM-shNT_STEM comparison:
+
+```{r}
+activated.df <- bitr(
+    shRAD52_STEM.shNT_STEM.activated.genes,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+repressed.df <- bitr(
+    shRAD52_STEM.shNT_STEM.repressed.genes,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+universe.df <- bitr(
+    protein_ids,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+activated.enrich.kegg.shRAD52_STEM.shNT_STEM <- enrichKEGG(
+    gene = activated.df$ENTREZID,
+    universe = universe.df$ENTREZID,
+    organism = "hsa",
+    pvalueCutoff  = 1)
+
+res <- activated.enrich.kegg.shRAD52_STEM.shNT_STEM@result
+
+res <- res[order(res$pvalue), ]
+head(res[, c("Description", "Count", "pvalue", "p.adjust")], 15)
+
+repressed.enrich.kegg.shRAD52_STEM.shNT_STEM <- enrichKEGG(
+    gene = repressed.df$ENTREZID,
+    universe = universe.df$ENTREZID,
+    organism = "hsa",
+    pvalueCutoff  = 1)
+
+res <- repressed.enrich.kegg.shRAD52_STEM.shNT_STEM@result
+
+res <- res[order(res$pvalue), ]
+head(res[, c("Description", "Count", "pvalue", "p.adjust")], 15)
+
+```
+
+For the record, the shNT_STEM-shNT_DIFF comparison:
+
+```{r}
+activated.df <- bitr(
+    shNT_STEM.shNT_DIFF.activated.genes,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+repressed.df <- bitr(
+    shNT_STEM.shNT_DIFF.repressed.genes,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+universe.df <- bitr(
+    protein_ids,
+    fromType = "SYMBOL",
+    toType = "ENTREZID",
+    OrgDb = org.Hs.eg.db)
+
+activated.enrich.kegg.shNT_STEM.shNT_DIFF <- enrichKEGG(
+    gene = activated.df$ENTREZID,
+    universe = universe.df$ENTREZID,
+    organism = "hsa",
+    pvalueCutoff  = 1)
+
+res <- activated.enrich.kegg.shNT_STEM.shNT_DIFF@result
+
+res <- res[order(res$pvalue), ]
+head(res[, c("Description", "Count", "pvalue", "p.adjust")], 15)
+
+repressed.enrich.kegg.shNT_STEM.shNT_DIFF <- enrichKEGG(
+    gene = repressed.df$ENTREZID,
+    universe = universe.df$ENTREZID,
+    organism = "hsa",
+    pvalueCutoff  = 1)
+
+res <- repressed.enrich.kegg.shNT_STEM.shNT_DIFF@result
+
+res <- res[order(res$pvalue), ]
+head(res[, c("Description", "Count", "pvalue", "p.adjust")], 15)
+
+```
+
+## GSEA (Gene Set Enrichment Analysis)
+
+### fgsea()
+
+Another way of obtaining enriched pathways. We will first try with fgsea(). First, the differentiated cells shRAD52_DIFF vs shNT_DIFF:
+
+```{r}
+set.seed(123) # Setting a fixed seed, because GSEA calculates the pvalues with
+              # Monte-Carlo sampling and so they may vary
+
+msig <- msigdbr(species = "Homo sapiens", collection = "H")  # Hallmark sets
+
+gene_sets <- msig %>%
+  dplyr::select(gs_name, gene_symbol) %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+ranks <- shRAD52_DIFF.shNT_DIFF$t
+names(ranks) <- rownames(shRAD52_DIFF.shNT_DIFF)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+fgseaRes.shRAD52_DIFF.shNT_DIFF <- fgsea(
+  pathways = gene_sets,
+  stats = ranks,
+  minSize = 5,
+  maxSize = 500)
+```
+
+There seems to be some pathways weakly enriched (only pvalue is <0.05 for some, but no adjusted pvalue). Let's do the other comparisons:
+
+```{r}
+ranks <- shRAD52_STEM.shNT_STEM$t
+names(ranks) <- rownames(shRAD52_STEM.shNT_STEM)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+fgseaRes.shRAD52_STEM.shNT_STEM <- fgsea(
+  pathways = gene_sets,
+  stats = ranks,
+  minSize = 5,
+  maxSize = 500)
+
+###################
+
+ranks <- shRAD52_STEM.shRAD52_DIFF$t
+names(ranks) <- rownames(shRAD52_STEM.shRAD52_DIFF)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+fgseaRes.shRAD52_STEM.shRAD52_DIFF <- fgsea(
+  pathways = gene_sets,
+  stats = ranks,
+  minSize = 5,
+  maxSize = 500)
+
+###################
+
+ranks <- shNT_STEM.shNT_DIFF$t
+names(ranks) <- rownames(shNT_STEM.shNT_DIFF)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+fgseaRes.shNT_STEM.shNT_DIFF <- fgsea(
+  pathways = gene_sets,
+  stats = ranks,
+  minSize = 5,
+  maxSize = 500)
+```
+
+#### FGSEA Plots
+
+For shNT_STEM.shNT_DIFF:
+
+```{r}
+ranks <- shNT_STEM.shNT_DIFF$t
+names(ranks) <- rownames(shNT_STEM.shNT_DIFF)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+plotEnrichment(gene_sets[["HALLMARK_DNA_REPAIR"]], ranks)
+
+###### NES Barplot
+
+plot_df <- fgseaRes.shNT_STEM.shNT_DIFF %>%
+  filter(padj < 0.05) %>%
+  arrange(NES)
+
+NES_barplot <- ggplot(plot_df,
+               aes(y = reorder(pathway, NES),
+                   x = NES,
+                   fill = NES)) +
+  geom_col() +
+  geom_vline(xintercept = 0,
+             linetype = "dashed") +
+  theme_classic()
+
+ggsave("NES_Barplot_STEMDIFF.svg", plot = NES_barplot, width = 9, height = 6)
+
+###### Dot plot
+
+dotplot <- ggplot(plot_df,
+       aes(NES, reorder(pathway, NES))) +
+    geom_point(aes(size = size,
+                   color = padj))
+
+ggsave("Dotplot_STEMDIFF.svg", plot = dotplot, width = 8, height = 6)
+```
+
+For shRAD52_STEM.shNT_STEM and shRAD52_DIFF.shNT_DIFF:
+
+```{r}
+plot_df <- fgseaRes.shRAD52_STEM.shNT_STEM %>%
+  filter(pval < 0.05) %>%
+  arrange(NES)
+
+dotplot <- ggplot(plot_df,
+       aes(NES, reorder(pathway, NES))) +
+    geom_point(aes(size = size,
+                   color = pval))
+
+ggsave("Dotplot_RAD52STEM.svg", plot = dotplot, width = 8, height = 6)
+
+################
+
+plot_df <- fgseaRes.shRAD52_DIFF.shNT_DIFF %>%
+  filter(pval < 0.05) %>%
+  arrange(NES)
+
+dotplot <- ggplot(plot_df,
+       aes(NES, reorder(pathway, NES))) +
+    geom_point(aes(size = size,
+                   color = pval))
+
+ggsave("Dotplot_RAD52DIFF.svg", plot = dotplot, width = 8, height = 6)
+
+```
+
+And for the Interaction comparison, previously defined:
+
+```{r}
+ranks <- interaction.contrast$t
+names(ranks) <- rownames(interaction.contrast)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+fgseaRes.interaction.contrast <- fgsea(
+  pathways = gene_sets,
+  stats = ranks,
+  minSize = 5,
+  maxSize = 500)
+```
+
+Not much to extract from here. Adjusted p-values are all high, and the only p.value < 0.05 is HALLMARK_UV_RESPONSE_UP, which would mean the reduction of the expression of RAD52 with the shRNA has different effects ond STEM and DIFF cells, and in STEM cells there is a reduction of the UV Response that is not seen in DIFF cells. Considering that UV Response might include genes related with DNA reparation and damage, it could be of interest.
+
+### camera()
+
+Now I will try with camera(), part of the limma package, with the shRAD52_DIFF-shNT_DIFF comparison as an example:
+
+```{r}
+cameraRes.shRAD52_DIFF.shNT_DIFF <- camera(
+    y = normalized_prot_DIFF,
+    index = gene_sets,
+    design = experimental_design_diff,
+    contrast = contrast_matrix_diff[,1])
+
+cameraRes.shRAD52_STEM.shNT_STEM <- camera(
+    y = normalized_prot_STEM,
+    index = gene_sets,
+    design = experimental_design_stem,
+    contrast = contrast_matrix_stem[,1])
+
+# cameraRes.interaction.contrast <- camera(
+#     y = normalized_protein,
+#     index = gene_sets,
+#     design = design,
+#     contrast = cont[,1])
+
+# No relevance for interaction.contrast
+
+cameraRes.shNT_STEM.shNT_DIFF <- camera(
+    y = normalized_protein,
+    index = gene_sets,
+    design = experimental.design,
+    contrast = contrast.matrix[,4])
+```
+
+### fry()
+
+It seems to obtain somewhat similar results, the first 5 pathways are the same, although in different order and different pvalues.
+
+Now fry():
+
+```{r}
+fryRes.shRAD52_DIFF.shNT_DIFF <- fry(
+  normalized_prot_DIFF,
+  index = gene_sets,
+  design = experimental_design_diff,
+  contrast = contrast_matrix_diff[,1])
+
+fryRes.shRAD52_STEM.shNT_STEM <- fry(
+  normalized_prot_STEM,
+  index = gene_sets,
+  design = experimental_design_stem,
+  contrast = contrast_matrix_stem[,1])
+
+fryRes.interaction.contrast <- fry(
+  normalized_protein,
+  index = gene_sets,
+  design = design,
+  contrast = cont[,1])
+
+fryRes.shNT_STEM.shNT_DIFF <- fry(
+  normalized_protein,
+  index = gene_sets,
+  design = experimental.design,
+  contrast = contrast.matrix[,4])
+```
+
+## GSVA (Gene Set Variation Analysis)
+
+### Individual analysis
+
+```{r}
+msig <- msigdbr(species = "Homo sapiens", collection = "H")  # Hallmark sets
+
+gene_sets <- msig %>%
+  dplyr::select(gs_name, gene_symbol) %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# shRAD52_DIFF-shNT_DIFF
+expr_mat_diff <- as.matrix(normalized_prot_DIFF)
+
+param_diff <- gsvaParam(
+  exprData = expr_mat_diff,
+  geneSets = gene_sets,
+  kcdf = "Gaussian"
+)
+
+gsva_res_diff <- gsva(param_diff)
+
+## Linear model fit to the experimental design, mean expression calculation
+gsva.linear.fit <- lmFit(gsva_res_diff, experimental_design_diff)
+
+## Contrast specification treatment-control
+gsva.contrast.matrix <- makeContrasts(shRAD52_DIFF-shNT_DIFF,
+                                 levels=c("shNT_DIFF","shRAD52_DIFF"))
+
+gsva.contrast.linear.fit <- contrasts.fit(gsva.linear.fit, gsva.contrast.matrix)
+gsva.contrast.results <- eBayes(gsva.contrast.linear.fit)
+
+## Results extraction for the first contrast (shRAD52_DIFF - shNT_DIFF) sorted according to logFC
+gsva.shRAD52_DIFF.shNT_DIFF <- topTable(gsva.contrast.results, 
+                      number=nrow(gsva_res_diff),
+                      coef=1,
+                      sort.by="logFC")
+head(gsva.shRAD52_DIFF.shNT_DIFF)
+
+##############################################################################
+
+# shRAD52_STEM-shNT_STEM
+expr_mat_stem <- as.matrix(normalized_prot_STEM)
+
+param_stem <- gsvaParam(
+  exprData = expr_mat_stem,
+  geneSets = gene_sets,
+  kcdf = "Gaussian"
+)
+
+gsva_res_stem <- gsva(param_stem)
+
+## Linear model fit to the experimental design, mean expression calculation
+gsva.linear.fit <- lmFit(gsva_res_stem, experimental_design_stem)
+
+## Contrast specification treatment-control
+gsva.contrast.matrix <- makeContrasts(shRAD52_STEM-shNT_STEM,
+                                 levels=c("shNT_STEM","shRAD52_STEM"))
+
+gsva.contrast.linear.fit <- contrasts.fit(gsva.linear.fit, gsva.contrast.matrix)
+gsva.contrast.results <- eBayes(gsva.contrast.linear.fit)
+
+## Results extraction for the second contrast (shRAD52_STEM - shNT_STEM) sorted according to logFC
+gsva.shRAD52_STEM.shNT_STEM <- topTable(gsva.contrast.results, 
+                      number=nrow(gsva_res_stem),
+                      coef=1,
+                      sort.by="logFC")
+head(gsva.shRAD52_STEM.shNT_STEM)
+```
+
+
+### Grouped analysis
+
+All of the contrasts, made in grouped fashion:
+
+```{r}
+expr_mat <- as.matrix(normalized_protein)
+
+param <- gsvaParam(
+  exprData = expr_mat,
+  geneSets = gene_sets,
+  kcdf = "Gaussian"
+)
+
+gsva_res <- gsva(param)
+
+## Linear model fit to the experimental design, mean expression calculation
+gsva.linear.fit <- lmFit(gsva_res, experimental.design)
+
+## Contrast specification treatment-control
+gsva.contrast.matrix <- makeContrasts(shRAD52_DIFF-shNT_DIFF,shRAD52_STEM-shNT_STEM,
+                                      shRAD52_STEM-shRAD52_DIFF,shNT_STEM-shNT_DIFF,
+                                 levels=c("shNT_DIFF","shNT_STEM","shRAD52_DIFF","shRAD52_STEM"))
+
+gsva.contrast.linear.fit <- contrasts.fit(gsva.linear.fit, gsva.contrast.matrix)
+gsva.contrast.results <- eBayes(gsva.contrast.linear.fit)
+
+## Results extraction for the first contrast shRAD52_DIFF - shNT_DIFF) sorted according to logFC
+grouped_gsva.shRAD52_DIFF.shNT_DIFF <- topTable(gsva.contrast.results, 
+                      number=nrow(gsva_res),
+                      coef=1,
+                      sort.by="P")
+head(grouped_gsva.shRAD52_DIFF.shNT_DIFF)
+
+## Results extraction for the second contrast (shRAD52_STEM - shNT_STEM) sorted according to logFC
+grouped_gsva.shRAD52_STEM.shNT_STEM <- topTable(gsva.contrast.results, 
+                      number=nrow(gsva_res),
+                      coef=2,
+                      sort.by="logFC")
+head(grouped_gsva.shRAD52_STEM.shNT_STEM)
+
+## Results extraction for the third contrast (shRAD52_STEM - shRAD52_DIFF) sorted according to logFC
+grouped_gsva.shRAD52_STEM.shRAD52_DIFF <- topTable(gsva.contrast.results, 
+                      number=nrow(gsva_res),
+                      coef=3,
+                      sort.by="logFC")
+head(grouped_gsva.shRAD52_STEM.shRAD52_DIFF)
+
+## Results extraction for the fourth contrast (shNT_STEM - shNT_DIFF) sorted according to logFC
+grouped_gsva.shNT_STEM.shNT_DIFF <- topTable(gsva.contrast.results, 
+                      number=nrow(gsva_res),
+                      coef=4,
+                      sort.by="logFC")
+head(grouped_gsva.shNT_STEM.shNT_DIFF)
+```
+
+
+
+---------------------- OBSOLETE -------------------------
+
+In differentiated cells with shRAD52 (vs no shRAD52), there's a significant increase in 'HALLMARK_IL6_JAK_STAT3_SIGNALING', I should look into that. There's also differences between the two shRAD52 contrasts, depending on whether they are done on stem or diferentiated cells. 3 of the significant pathways are the same, but with shRAD52 "HALLMARK_COMPLEMENT" is present, and without it "HALLMARK_APICAL_SURFACE" is present
+
+Update 14/05: when imputing data, the IL6_JAK_STAT3 significant increase no longer exists in differentiated cells with/without shRAD52 (p.adj = 0.133), which complicates things a little. However, the p.adj is still relatively low, and without adjusting it is significant (even though it is a bad statistical practice). When comparing expression levels of the pathway in the different conditions, a similar effect seems to exist for the stem cells (not significantly, though). We could still look into that. Also, for the STEM vs DIFF comparisons, many more significantly expressed pathways are found.
+
+---------------------------------------------------------
+
+
+Seeing which pathways are common to the two shNT vs shRAD52 comparisons, and which are unique to each comparison:
+NOTE: It doesn't work because I haven't saved the significant pathways in a variable. I don't think it's so relevant anyway, can be easily looked up manually.
+
+```{r}
+gsva.shRAD52_DIFF.shNT_DIFF.significant <- gsva.shRAD52_DIFF.shNT_DIFF[]
+
+intersect_pathways <- intersect(rownames(gsva.shNT_STEM.shNT_DIFF.significant), rownames(grouped_gsva.shRAD52_STEM.shRAD52_DIFF.significant))
+unique_pathways_shNT.STEM.DIFF <- setdiff(rownames(grouped_gsva.shNT_STEM.shNT_DIFF.significant), intersect.pathways)
+unique_pathways_shRAD52.STEM.DIFF <- setdiff(rownames(grouped_gsva.shRAD52_STEM.shRAD52_DIFF.significant), intersect.pathways)
+
+```
+
+This meta structure here created is used later for other parts like the boxplot.
+
+```{r}
+## Experimental design specification
+samples <- colnames(normalized_protein)
+
+# Create metadata
+meta <- data.frame(
+  sample_id = samples,
+  shRNA = ifelse(grepl("^shNT", samples), "Control", "RAD52"),
+  cell_type = ifelse(grepl("_DIFF_", samples), "DGC", "GSC"),
+  row.names = samples
+)
+
+# Convert to factors with correct reference levels
+meta$cell_type <- factor(meta$cell_type, levels = c("DGC", "GSC"))
+meta$shRNA <- factor(meta$shRNA, levels = c("Control", "RAD52"))
+
+# Making sure the metadata rows have the same order as the columns in the GSVA
+meta <- meta[colnames(gsva_res), ]
+```
+
+Plotting a boxplot of a relevant pathway (could be changed later to include other pathways depending on what we find):
+
+```{r}
+df_dna_repair <- data.frame(
+  score = gsva_res["HALLMARK_DNA_REPAIR", ],
+  meta
+)
+ggplot(df_dna_repair, aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("HALLMARK_DNA_REPAIR")
+
+df_e2f_targets <- data.frame(
+  score = gsva_res["HALLMARK_E2F_TARGETS", ],
+  meta
+)
+ggplot(df_e2f_targets, aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("HALLMARK_E2F_TARGETS")
+
+df_jak_stat3 <- data.frame(
+  score = gsva_res["HALLMARK_IL6_JAK_STAT3_SIGNALING", ],
+  meta
+)
+ggplot(df_jak_stat3, aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("HALLMARK_IL6_JAK_STAT3_SIGNALING")
+
+df_myc_targets <- data.frame(
+  score = gsva_res["HALLMARK_MYC_TARGETS_V2", ],
+  meta
+)
+ggplot(df_myc_targets, aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("HALLMARK_MYC_TARGETS_V2")
+
+df_epithelial_mesenchymal <- data.frame(
+  score = gsva_res["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION", ],
+  meta
+)
+gsva_plot <- ggplot(df_epithelial_mesenchymal,
+                    aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot(width = 0.5, position = position_dodge(width = 0.7)) +
+  theme_minimal() +
+  scale_x_discrete(expand = expansion(mult = c(0.1, 0.1))) +
+  ggtitle("HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION")
+
+ggsave("GSVA_EMT.svg", plot = gsva_plot, width = 6, height = 6)
+
+df_mtor <- data.frame(
+  score = gsva_res["HALLMARK_PI3K_AKT_MTOR_SIGNALING", ],
+  meta
+)
+ggplot(df_mtor, aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("HALLMARK_PI3K_AKT_MTOR_SIGNALING")
+
+df_oxphos <- data.frame(
+  score = gsva_res["HALLMARK_OXIDATIVE_PHOSPHORYLATION", ],
+  meta
+)
+ggplot(df_oxphos, aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("HALLMARK_OXIDATIVE_PHOSPHORYLATION")
+
+df_uv_up <- data.frame(
+  score = gsva_res["HALLMARK_UV_RESPONSE_UP", ],
+  meta
+)
+gsva_plot <- ggplot(df_uv_up,
+                    aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot(width = 0.5, position = position_dodge(width = 0.7)) +
+  theme_minimal() +
+  scale_x_discrete(expand = expansion(mult = c(0.1, 0.1))) +
+  ggtitle("HALLMARK_UV_RESPONSE_UP")
+
+ggsave("GSVA_UV_UP.svg", plot = gsva_plot, width = 6, height = 6)
+
+df_apoptosis <- data.frame(
+  score = gsva_res["HALLMARK_APOPTOSIS", ],
+  meta
+)
+gsva_plot <- ggplot(df_apoptosis,
+                    aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot(width = 0.5, position = position_dodge(width = 0.7)) +
+  theme_minimal() +
+  scale_x_discrete(expand = expansion(mult = c(0.1, 0.1))) +
+  ggtitle("GSVA_APOPTOSIS.svg")
+
+ggsave("GSVA_APOPTOSIS.svg", plot = gsva_plot, width = 6, height = 6)
+
+df_hypoxia <- data.frame(
+  score = gsva_res["HALLMARK_HYPOXIA", ],
+  meta
+)
+ggplot(df_hypoxia, aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("HALLMARK_HYPOXIA")
+
+df_estrogen_late <- data.frame(
+  score = gsva_res["HALLMARK_ESTROGEN_RESPONSE_LATE", ],
+  meta
+)
+ggplot(df_estrogen_late, aes(x = cell_type, y = score, fill = shRNA)) +
+  geom_boxplot() +
+  theme_minimal() +
+  ggtitle("HALLMARK_ESTROGEN_RESPONSE_LATE")
+```
+
+
+
+In the boxplot, we see reduced gene expression of the DNA Repair pathways in the RAD52 KO compared to the controls. Considering that RAD52 is involved in DNA repair, this could fit the general idea of the experiment.
+
+Now, let's try a heatmap:
+
+```{r}
+library(pheatmap)
+
+pathways <- rownames(na.omit(gsva_res))
+
+pheatmap(gsva_res[pathways, ],
+         annotation_col = meta[, c("cell_type", "shRNA")])
+```
+
+## Stemness
+
+We are going to try to measure the "stemness" of the differents groups. For this, we will use different gene sets that are related to glioblastoma stem cells. These sets come from 4 different articles, each of which relate their gene set to a specific characteristic (epithelial-mesenchymal transition and radiotherapy resistance, for instance). The articles used are:
+
+-   A CD133-related gene expression signature identifies an aggressive glioblastoma subtype with excessive mutations. <https://pmc.ncbi.nlm.nih.gov/articles/PMC3029739/>
+-   A novel gene signature based on five glioblastoma stem-like cell relevant genes predicts the survival of primary glioblastoma. <https://pmc.ncbi.nlm.nih.gov/articles/PMC11813501/>
+-   A Multi-Cancer Mesenchymal Transition Gene Expression Signature Is Associated with Prolonged Time to Recurrence in Glioblastoma. <https://pmc.ncbi.nlm.nih.gov/articles/PMC3321034/>
+-   A Stemness-Related Gene Signature to Predict Treatment Efficacy of Radiotherapy in Glioblastoma. <https://www.sciencedirect.com/science/article/pii/S0360301622015589>
+
+A proteomics specific paper showing their own gene signature will also be used: Okawa et al., Proteome and secretome characterisation of glioblastoma-derived neural stem cells: https://pmc.ncbi.nlm.nih.gov/articles/PMC6135235
+
+And this one: Lottaz et al. (2010), Cancer Research
+
+Loading the data from that paper:
+
+```{r}
+# Read the Excel sheet
+okawa_data <- read_excel("Okawa_Data.xls", sheet = 1, skip = 1 )
+
+# Clean the paper's dataset by separating the merged symbols into separate rows
+okawa_expanded <- okawa_data %>%
+  # Separate rows splits "AAG4;APOJ;CLU" into 3 distinct rows, copying the expression data
+  separate_rows(Gene.Names, sep = ";") %>%
+  # Clean up any accidental whitespace around the symbols
+  mutate(Gene.Names = trimws(Gene.Names))
+
+# Extract a clean vector of my valid gene symbols
+valid_symbols <- rownames(normalized_protein)
+
+# 3. Filter the paper's expanded dataset to ONLY keep rows that match your dataset
+okawa_cleaned_and_matched <- okawa_expanded %>%
+  filter(Gene.Names %in% valid_symbols)
+
+# 4. Extract the final gene signature list for GSEA
+# (Filtering for significantly upregulated proteins using the cleaned column)
+okawa_stem_markers <- okawa_cleaned_and_matched %>%
+  filter(`Mean 
+Normalized 
+mean log2 
+Ratio of the 4 samples` > 1 & `Differential abundance 
+Adjusted p value` < 0.05) %>%
+  pull(Gene.Names) %>%
+  unique()
+
+okawa_non_stem_markers <- okawa_cleaned_and_matched %>%
+  filter(`Mean 
+Normalized 
+mean log2 
+Ratio of the 4 samples` > -1 & `Differential abundance 
+Adjusted p value` < 0.05) %>%
+  pull(Gene.Names) %>%
+  unique()
+
+```
+
+
+### GSVA Stemness
+
+For this, we will create the gene set lists and perform a GSVA analysis to see how each condition scores. As the two stem cell conditions are very similar (with or without RAD52 KO), this could be especially interesting in the differentiated cells with and without RAD52 KO, to see if the KO as affected the "stemness" of the cells.
+
+```{r}
+# 1. CD133+ glioblastoma stem cell signature (core subset)
+GBM_CD133_STEMNESS = c(
+  "AKAP4", "ARHGAP11A", "ASPM", "BARD1", "BIRC5", "BRCA1", "C12orf32", 
+  "C17orf80", "C2orf48", "C4orf21", "CAPN14", "CASC5", "CCDC102A", 
+  "CCDC111", "CCDC15", "CDCA2", "CDKN3", "CENPH", "CENPK", "CKAP2L", 
+  "CKS2", "CTNNAL1", "DHFR", "DHX57", "DIAPH3", "DLGAP5", "DTL", 
+  "DTYMK", "ECT2", "ENAH", "FANCI", "FBXO5", "GGH", "GINS2", "GMNN", 
+  "H2AFZ", "HMGB2", "IFNA17", "IFNA4", "JAM2", "KIAA0101", "KIF11", 
+  "KIF15", "KIF2C", "KIF4A", "KNTC1", "LIG1", "LMAN1L", "LOC91431", 
+  "MAD2L1", "MCM2", "MCM3", "MELK", "MND1", "MORN2", "NACA", "NCAPH", 
+  "NDC80", "NEK2", "NMU", "NUF2", "PBK", "PCNA", "POLQ", "PRIM1", 
+  "PROM1", "PSG5", "PTTG1", "PTTG3", "PXMP2", "RAD51", "RANBP1", 
+  "RRM2", "RTKN", "SGOL1", "SLC2A11", "SMC2", "SNRPE", "SYTL4", 
+  "TIMELESS", "TM4SF1", "TMEM106C", "TOP2A", "TPX2", "TRIP13", 
+  "TROAP", "TTK", "TYMS", "WDR34")
+
+# Filter to use only the genes in our dataset
+GBM_CD133_STEMNESS <- 
+  GBM_CD133_STEMNESS[GBM_CD133_STEMNESS %in% rownames(normalized_protein)]
+
+# 2. 5-gene GBM stemness signature
+GBM_5GENE_STEMNESS = c(
+  "ADAMTSL4",
+  "CLEC5A",
+  "FTSJ2",
+  "IBSP",
+  "SFXN4")
+
+GBM_5GENE_STEMNESS <- 
+  GBM_5GENE_STEMNESS[GBM_5GENE_STEMNESS %in% rownames(normalized_protein)]
+
+# 3. Mesenchymal / plasticity stemness signature
+GBM_MESENCHYMAL_STEMNESS = c(
+  "CD44", "FN1", "VCAN", "LOX", "LOXL2",
+  "COL1A1", "COL1A2", "COL5A1",
+  "STEMTN", "SPARC",
+  "SNAI2", "ZEB1",
+  "TGFB1", "TGFBI",
+  "MMP2", "MMP9")
+
+GBM_MESENCHYMAL_STEMNESS <- 
+  GBM_MESENCHYMAL_STEMNESS[GBM_MESENCHYMAL_STEMNESS %in% rownames(normalized_protein)]
+
+# 4. 9-gene radiotherapy-associated stemness signature
+GBM_RADIORESISTANCE_STEMNESS = c(
+  "ASPM", "EPHA1", "LIF", "LOXL2",
+  "NAP1L2", "OTP", "PITX2",
+  "RDH10", "RUNX1")
+  
+GBM_RADIORESISTANCE_STEMNESS <- 
+  GBM_RADIORESISTANCE_STEMNESS[GBM_RADIORESISTANCE_STEMNESS %in% rownames(normalized_protein)]
+
+# Lottaz/Beier gene set
+beier_stem_markers <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP") %>%
+  filter(gs_name %in% "BEIER_GLIOMA_STEM_CELL_UP") %>%
+  pull(gene_symbol)
+
+beier_non_stem_markers <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP") %>%
+  filter(gs_name %in% "BEIER_GLIOMA_STEM_CELL_DN") %>%
+  pull(gene_symbol)
+
+guenther_stem_markers <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP") %>%
+  filter(gs_name %in% "GUENTHER_GROWTH_SPHERICAL_VS_ADHERENT_UP") %>%
+  pull(gene_symbol)
+
+guenther_non_stem_markers <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP") %>%
+  filter(gs_name %in% "GUENTHER_GROWTH_SPHERICAL_VS_ADHERENT_DN") %>%
+  pull(gene_symbol)
+
+wong_stem_markers <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP") %>%
+  filter(gs_name %in% "WONG_EMBRYONIC_STEM_CELL_CORE") %>%
+  pull(gene_symbol)
+
+benporath_stem_markers <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP") %>%
+  filter(gs_name %in% "BENPORATH_ES_1") %>%
+  pull(gene_symbol)
+
+verhaak_stem_markers <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CGP") %>%
+  filter(gs_name %in% "VERHAAK_GLIOBLASTOMA_PRONEURAL") %>%
+  pull(gene_symbol)
+
+
+gbm_stemness_sets <- list(GBM_CD133_STEMNESS,
+                          # GBM_5GENE_STEMNESS,
+                          # GBM_MESENCHYMAL_STEMNESS, GBM_RADIORESISTANCE_STEMNESS,
+                          # okawa_stem_markers, okawa_non_stem_markers,
+                          # beier_stem_markers, beier_non_stem_markers,
+                          # guenther_stem_markers, guenther_non_stem_markers,
+                          wong_stem_markers, benporath_stem_markers
+                          # verhaak_stem_markers
+                          )
+
+names(gbm_stemness_sets) <- c(
+    "Stemness_CD133_signature",
+    # "Stemness5_signature",
+    # "MES_signature",
+    # "Radioresistance_signature",
+    # "Okawa Stem Markers",
+    # "Okawa Non-Stem Markers",
+    # "Beier Stem Markers",
+    # "Beier Non-Stem Markers",
+    # "Guenther Stem Markers",
+    # "Guenther Non-Stem Markers",
+    "Wong Stem Markers",
+    "Benporath Stem Markers"
+    # "Verhaak Stem Markers"
+    )
+```
+
+We can check how many of the genes in the gene sets are actually in our proteomic data:
+
+```{r}
+lapply(gbm_stemness_sets, function(gs) {
+  sum(gs %in% rownames(normalized_protein))
+})
+```
+
+We see that from the second gene set, only 1 out of 5 genes are actually present in the data. From the fourth gene set, 3 out of 9 are present. This may make the results from these datasets unstable. Perhaps we will have to focus on the other two.
+
+```{r}
+param_stemness <- gsvaParam(
+  exprData = expr_mat,
+  geneSets = gbm_stemness_sets,
+  kcdf = "Gaussian"  # Using ssGSEA, which is in theory more robust for small gene sets
+)
+
+gsva_stemness_res <- gsva(param_stemness)
+
+## Linear model fit to the experimental design, mean expression calculation
+gsva.stem.linear.fit <- lmFit(gsva_stemness_res, experimental.design)
+
+## Contrast specification treatment-control
+gsva.stem.contrast.matrix <- makeContrasts(shRAD52_DIFF-shNT_DIFF,shRAD52_STEM-shNT_STEM,
+                                      shRAD52_STEM-shRAD52_DIFF,shNT_STEM-shNT_DIFF,
+                                      
+                                 levels=c("shNT_DIFF","shNT_STEM","shRAD52_DIFF","shRAD52_STEM"))
+
+gsva.stem.contrast.linear.fit <- contrasts.fit(gsva.stem.linear.fit, gsva.stem.contrast.matrix)
+gsva.stem.contrast.results <- eBayes(gsva.stem.contrast.linear.fit)
+
+## Results extraction for the first contrast (shRAD52_DIFF - shNT_DIFF) sorted according to logFC
+gsva.stem.shRAD52_DIFF.shNT_DIFF <- topTable(gsva.stem.contrast.results, 
+                      number=nrow(gsva_stemness_res),
+                      coef=1,
+                      sort.by="logFC")
+gsva.stem.shRAD52_DIFF.shNT_DIFF
+
+## Results extraction for the second contrast (shRAD52_STEM - shNT_STEM) sorted according to logFC
+gsva.stem.shRAD52_STEM.shNT_STEM <- topTable(gsva.stem.contrast.results, 
+                      number=nrow(gsva_res),
+                      coef=2,
+                      sort.by="logFC")
+gsva.stem.shRAD52_STEM.shNT_STEM
+
+## Results extraction for the fourth contrast (shNT_STEM - shNT_DIFF) sorted according to logFC
+gsva.stem.shNT_STEM.shNT_DIFF <- topTable(gsva.stem.contrast.results, 
+                      number=nrow(gsva_res),
+                      coef=4,
+                      sort.by="logFC")
+gsva.stem.shNT_STEM.shNT_DIFF
+```
+
+So between the stem cells and the differentiated ones, there are expected significant changes in the gene sets (except dataset 2, in which only 1 gene was present in our study and therefore isn't reliable). However, between the RAD52 KO and non KO of the differentiated cells, no significant differences in stemness are found. There could be a diminished stemness after shRAD52 treatment according to the radiotherapy geneset, the 4th one (logFC = -0.52684738, p.val = 0.04264624, adj.p.val = 0.1705850), but it is not especially reliable with only 3 genes being used for that comparison.
+
+### GSEA Stemness
+
+Calculating stemness, but with GSEA methods instead of GSVA
+
+```{r}
+# RAD52 DIFF
+ranks <- shRAD52_DIFF.shNT_DIFF$t
+names(ranks) <- rownames(shRAD52_DIFF.shNT_DIFF)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+stemness.fgseaRes.shRAD52_DIFF.shNT_DIFF <- fgsea(
+  pathways = gbm_stemness_sets,
+  stats = ranks,
+  minSize = 5,
+  maxSize = 500)
+
+stemness.fgseaRes.shRAD52_DIFF.shNT_DIFF
+
+# RAD52 STEM
+ranks <- shRAD52_STEM.shNT_STEM$t
+names(ranks) <- rownames(shRAD52_STEM.shNT_STEM)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+stemness.fgseaRes.shRAD52_STEM.shNT_STEM <- fgsea(
+  pathways = gbm_stemness_sets,
+  stats = ranks,
+  minSize = 5,
+  maxSize = 500)
+
+stemness.fgseaRes.shRAD52_STEM.shNT_STEM
+
+# STEM - DIFF
+
+ranks <- shNT_STEM.shNT_DIFF$t
+names(ranks) <- rownames(shNT_STEM.shNT_DIFF)
+
+ranks <- sort(ranks, decreasing = TRUE)
+
+stemness.fgseaRes.shNT_STEM.shNT_DIFF <- fgsea(
+  pathways = gbm_stemness_sets,
+  stats = ranks,
+  minSize = 5,
+  maxSize = 500)
+
+stemness.fgseaRes.shNT_STEM.shNT_DIFF
+```
+
+```{r}
+interactors <- read.csv(file = "BIOGRID-GENE-111830-5.0.257.tab3.txt", sep = '\t')
+```
+
+## Transcription Factor Enrichment
+
+### TF Enrichment Calculation
+
+We will try infer the activated Transcription Factors (TF) from the protein expression dataset using Dorothea and decoupleR.
+
+```{r}
+# Using the t-statistic as a measure of change
+stat_vec <- shNT_STEM.shNT_DIFF$t
+names(stat_vec) <- rownames(shNT_STEM.shNT_DIFF)
+
+# Loading the TF data from dorothea
+data(dorothea_hs, package = "dorothea")
+
+# Keeping only higher-confidence interactions (dorothea classifies the
+# confidence of the interactions in 5 categories, A-E):
+regulons <- dorothea_hs %>%
+  filter(confidence %in% c("A","B"))
+
+# Creating an input matrix for decoupleR
+mat <- matrix(
+  stat_vec,
+  ncol = 1,
+  dimnames = list(names(stat_vec), "STEM_vs_DIFF"))
+
+# We will run several models and see the consensus features 
+
+TF_ulm_STEM_DIFF <- run_ulm(
+  mat = mat,
+  network = regulons,
+  .source = "tf",
+  .target = "target",
+  .mor = "mor")
+
+TF_mlm_STEM_DIFF <- run_mlm(
+  mat = mat,
+  network = regulons,
+  .source = "tf",
+  .target = "target",
+  .mor = "mor")
+
+# Now, to select only those which are significant in both methods, for higher
+# confidence
+significant_TF_mlm_STEM_DIFF <- TF_mlm_STEM_DIFF[TF_mlm_STEM_DIFF$p_value<0.05,]
+significant_TF_ulm_STEM_DIFF <- TF_ulm_STEM_DIFF[TF_ulm_STEM_DIFF$p_value<0.05,]
+
+intersection_TF_STEM_DIFF <- intersect(significant_TF_mlm_STEM_DIFF$source,significant_TF_ulm_STEM_DIFF$source)
+```
+
+For the RAD52 vs NT comparison in STEM cells:
+
+```{r}
+# Using the t-statistic as a measure of change
+stat_vec <- shRAD52_STEM.shNT_STEM$t
+names(stat_vec) <- rownames(shRAD52_STEM.shNT_STEM)
+
+# Loading the TF data from dorothea
+data(dorothea_hs, package = "dorothea")
+
+# Keeping only higher-confidence interactions (dorothea classifies the
+# confidence of the interactions in 5 categories, A-E):
+regulons <- dorothea_hs %>%
+  filter(confidence %in% c("A","B"))
+
+# Creating an input matrix for decoupleR
+mat <- matrix(
+  stat_vec,
+  ncol = 1,
+  dimnames = list(names(stat_vec), "RAD52_vs_NT"))
+
+# We will run several models and see the consensus features 
+
+TF_ulm_RAD52_STEM <- run_ulm(
+  mat = mat,
+  network = regulons,
+  .source = "tf",
+  .target = "target",
+  .mor = "mor")
+
+TF_mlm_RAD52_STEM <- run_mlm(
+  mat = mat,
+  network = regulons,
+  .source = "tf",
+  .target = "target",
+  .mor = "mor")
+
+# Now, to select only those which are significant in both methods, for higher
+# confidence
+significant_TF_mlm_RAD52_STEM <- TF_mlm_RAD52_STEM[TF_mlm_RAD52_STEM$p_value<0.05,]
+significant_TF_ulm_RAD52_STEM <- TF_ulm_RAD52_STEM[TF_ulm_RAD52_STEM$p_value<0.05,]
+
+intersection_TF_RAD52_STEM <- intersect(significant_TF_mlm_RAD52_STEM$source,significant_TF_ulm_RAD52_STEM$source)
+```
+
+And for the RAD52 vs NT comparison in DIFF cells:
+
+```{r}
+# Using the t-statistic as a measure of change
+stat_vec <- shRAD52_DIFF.shNT_DIFF$t
+names(stat_vec) <- rownames(shRAD52_DIFF.shNT_DIFF)
+
+# Loading the TF data from dorothea
+data(dorothea_hs, package = "dorothea")
+
+# Keeping only higher-confidence interactions (dorothea classifies the
+# confidence of the interactions in 5 categories, A-E):
+regulons <- dorothea_hs %>%
+  filter(confidence %in% c("A","B","C"))  # Including category C because of lack
+                                          # of results using only A and B
+
+# Creating an input matrix for decoupleR
+mat <- matrix(
+  stat_vec,
+  ncol = 1,
+  dimnames = list(names(stat_vec), "RAD52_vs_NT"))
+
+# We will run several models and see the consensus features 
+
+TF_ulm_RAD52_DIFF <- run_ulm(
+  mat = mat,
+  network = regulons,
+  .source = "tf",
+  .target = "target",
+  .mor = "mor")
+
+TF_mlm_RAD52_DIFF <- run_mlm(
+  mat = mat,
+  network = regulons,
+  .source = "tf",
+  .target = "target",
+  .mor = "mor")
+
+# Now, to select only those which are significant in both methods, for higher
+# confidence
+significant_TF_mlm_RAD52_DIFF <- TF_mlm_RAD52_DIFF[TF_mlm_RAD52_DIFF$p_value<0.05,]
+significant_TF_ulm_RAD52_DIFF <- TF_ulm_RAD52_DIFF[TF_ulm_RAD52_DIFF$p_value<0.05,]
+intersection_TF_RAD52_DIFF <- intersect(significant_TF_mlm_RAD52_DIFF$source,significant_TF_ulm_RAD52_DIFF$source)
+```
+
+Dotplot, barplot, volcanoplot
+
+```{r}
+thap11_targets <- regulons %>%
+  dplyr::filter(tf == "THAP11")
+
+## Visualization1
+
+target_count <- regulons %>%
+  filter(target %in% rownames(mat)) %>%
+  count(tf, name = "n_targets")
+
+plot_df <- TF_mlm_RAD52_DIFF %>%
+  left_join(target_count,
+            by = c("source" = "tf")) %>%
+  mutate(
+    neglog10p = -log10(p_value),
+    Significant = p_value < 0.05) %>%
+  filter(p_value < 0.05)
+
+plot_df$Label <- ifelse(
+    plot_df$p_value < 0.02 &
+    abs(plot_df$score) > 2,
+    plot_df$source,
+    ""
+)
+
+ggplot(plot_df,
+       aes(score,
+           reorder(source, score))) +
+
+    geom_point(aes(size = n_targets,
+                   colour = neglog10p),
+               alpha = 0.9) +
+
+    geom_text_repel(aes(label = Label),
+                    size = 3.5,
+                    max.overlaps = Inf) +
+
+    scale_colour_gradient(
+        low = "grey80",
+        high = "#D73027",
+        name = expression(-log[10](italic(P)))
+    ) +
+
+    scale_size(
+        range = c(2,10),
+        name = "Detected\ntargets"
+    ) +
+
+    geom_vline(xintercept = 0,
+               linetype = 2,
+               colour = "grey60") +
+
+    labs(x = "TF activity score (ULM)",
+         y = NULL) +
+
+    theme_classic(base_size = 14) +
+
+    theme(
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position = "right"
+    )
+
+# Barplot
+ggplot(plot_df,
+       aes(x = score,
+           y = reorder(source, score))) +
+    geom_col() +
+    theme_classic()
+```
+
+Consensus MLM+ULM plot (RAD52_DIFF)
+
+```{r}
+regulons <- dorothea_hs %>%
+  filter(confidence %in% c("A","B","C"))
+
+target_count <- regulons %>%
+  filter(target %in% rownames(mat)) %>%
+  count(tf, name = "n_targets")
+
+consensus_df <- TF_ulm_RAD52_DIFF %>%
+  dplyr::select(source,
+         ulm_score = score,
+         ulm_p = p_value) %>%
+  inner_join(
+    TF_mlm_RAD52_DIFF %>%
+      dplyr::select(source,
+             mlm_score = score,
+             mlm_p = p_value),
+    by = "source"
+  ) %>%
+  left_join(
+    target_count,
+    by = c("source" = "tf")
+  )
+
+consensus_df <- consensus_df %>%
+  mutate(
+    consensus_p = pmax(ulm_p, mlm_p),      # the less significant p-value
+    neglog10p = -log10(consensus_p),
+
+    significant =
+      ulm_p < 0.05 &
+      mlm_p < 0.05,
+
+    label = ifelse(significant, source, "")
+  )
+
+consensus_df <- consensus_df %>%
+  mutate(mean_score = (ulm_score + mlm_score)/2)
+
+consensus_rad52diff_plot <- ggplot(consensus_df,
+       aes(x = ulm_score,
+           y = mlm_score,
+           colour = mean_score)) +
+  
+    # --- quadrant shading ---
+  annotate("rect",
+           xmin = -Inf, xmax = 0,
+           ymin = -Inf, ymax = 0,
+           fill = "#3B6FB6", alpha = 0.08) +
+
+  annotate("rect",
+           xmin = 0, xmax = Inf,
+           ymin = 0, ymax = Inf,
+           fill = "#C0392B", alpha = 0.08) +
+
+  ################
+  
+  geom_hline(yintercept = 0,
+             linetype = 2,
+             colour = "grey80") +
+
+  geom_vline(xintercept = 0,
+             linetype = 2,
+             colour = "grey80") +
+
+  geom_abline(intercept = 0,
+              slope = 1,
+              colour = "grey60",
+              linewidth = 0.5) +
+
+  geom_point(
+    aes(size = n_targets,
+        colour = neglog10p),
+    alpha = 0.85
+  ) +
+
+  geom_text_repel(
+  aes(label = label),
+  fontface = "bold",
+  size = 4,
+  box.padding = 0.5,
+  point.padding = 0.4,
+  segment.color = "grey60",
+  segment.size = 0.4,
+  max.overlaps = Inf
+  ) +
+
+  scale_colour_gradient2(
+    low = "blue",
+    mid = "grey92",
+    high = "red",
+    midpoint = 0
+  ) +
+
+  scale_size(
+    range = c(2,10),
+    name = "Detected\ntargets"
+  ) +
+
+  labs(
+    x = "ULM activity score",
+    y = "MLM activity score"
+  ) +
+
+  #coord_equal() +
+  
+  coord_cartesian(xlim = c(-3.2, 3.4), ylim = c(-2.9, 3.4)) +
+  
+  geom_point(
+    data = subset(consensus_df, significant),
+    shape = 21,
+    stroke = 1.2,
+    colour = "black",
+    fill = NA,
+    aes(size = n_targets)
+  ) +
+
+  theme_classic(base_size = 14)
+
+ggsave("TF_RAD52DIFF.svg", plot = consensus_rad52diff_plot, width = 8, height = 6)
+```
+
+Consensus MLM+ULM plot (RAD52_STEM)
+
+```{r}
+regulons <- dorothea_hs %>%
+  filter(confidence %in% c("A","B"))
+
+target_count <- regulons %>%
+  filter(target %in% rownames(mat)) %>%
+  count(tf, name = "n_targets")
+
+consensus_df <- TF_ulm_RAD52_STEM %>%
+  dplyr::select(source,
+         ulm_score = score,
+         ulm_p = p_value) %>%
+  inner_join(
+    TF_mlm_RAD52_STEM %>%
+      dplyr::select(source,
+             mlm_score = score,
+             mlm_p = p_value),
+    by = "source"
+  ) %>%
+  left_join(
+    target_count,
+    by = c("source" = "tf")
+  )
+
+consensus_df <- consensus_df %>%
+  mutate(
+    consensus_p = pmax(ulm_p, mlm_p),      # the less significant p-value
+    neglog10p = -log10(consensus_p),
+
+    significant =
+      ulm_p < 0.05 &
+      mlm_p < 0.05,
+
+    label = ifelse(significant, source, "")
+  )
+
+consensus_df <- consensus_df %>%
+  mutate(mean_score = (ulm_score + mlm_score)/2)
+
+consensus_rad52stem_plot <- ggplot(consensus_df,
+       aes(x = ulm_score,
+           y = mlm_score,
+           colour = mean_score)) +
+  
+    # --- quadrant shading ---
+  annotate("rect",
+           xmin = -Inf, xmax = 0,
+           ymin = -Inf, ymax = 0,
+           fill = "#3B6FB6", alpha = 0.08) +
+
+  annotate("rect",
+           xmin = 0, xmax = Inf,
+           ymin = 0, ymax = Inf,
+           fill = "#C0392B", alpha = 0.08) +
+
+  ################
+  
+  geom_hline(yintercept = 0,
+             linetype = 2,
+             colour = "grey80") +
+
+  geom_vline(xintercept = 0,
+             linetype = 2,
+             colour = "grey80") +
+
+  geom_abline(intercept = 0,
+              slope = 1,
+              colour = "grey60",
+              linewidth = 0.5) +
+
+  geom_point(
+    aes(size = n_targets,
+        colour = neglog10p),
+    alpha = 0.85
+  ) +
+
+  geom_text_repel(
+  aes(label = label),
+  fontface = "bold",
+  size = 4,
+  box.padding = 0.5,
+  point.padding = 0.4,
+  segment.color = "grey60",
+  segment.size = 0.4,
+  max.overlaps = Inf
+  ) +
+
+  scale_colour_gradient2(
+    low = "blue",
+    mid = "grey92",
+    high = "red",
+    midpoint = 0
+  ) +
+
+  scale_size(
+    range = c(2,10),
+    name = "Detected\ntargets"
+  ) +
+
+  labs(
+    x = "ULM activity score",
+    y = "MLM activity score"
+  ) +
+
+  coord_equal() +
+  
+  #coord_cartesian(xlim = c(-3.2, 3.4), ylim = c(-2.9, 3.4)) +
+  
+  geom_point(
+    data = subset(consensus_df, significant),
+    shape = 21,
+    stroke = 1.2,
+    colour = "black",
+    fill = NA,
+    aes(size = n_targets)
+  ) +
+
+  theme_classic(base_size = 14)
+
+ggsave("TF_RAD52STEM.svg", plot = consensus_rad52stem_plot, width = 8, height = 6)
+```
+
+The following code checks how many targets of each TF is covered in our protein dataset.
+
+```{r}
+covered_targets <- regulons %>%
+  filter(target %in% rownames(mat)) %>%
+  count(tf)
+```
+
+### Visualization
+
+```{r}
+
+```
+
+Heatmap (doesn't work in this case because it needs at least 2 different objects to cluster, but the code might be useful):
+
+```{r}
+n_tfs <- 15
+
+# Transform to wide matrix
+sample_acts_mat <- res_ulm_STEM_DIFF %>%
+                   tidyr::pivot_wider(id_cols = 'condition', 
+                                      names_from = 'source',
+                                      values_from = 'score') %>%
+                   tibble::column_to_rownames('condition') %>%
+                   as.matrix()
+
+# Get top tfs with more variable means across clusters
+tfs <- res_ulm_STEM_DIFF %>%
+       dplyr::group_by(source) %>%
+       dplyr::summarise(std = stats::sd(score)) %>%
+       dplyr::arrange(-abs(std)) %>%
+       head(n_tfs) %>%
+       dplyr::pull(source)
+
+sample_acts_mat <- sample_acts_mat[,tfs]
+
+# Scale per sample
+sample_acts_mat <- scale(sample_acts_mat)
+
+# Choose color palette
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu"))
+colors.use <- grDevices::colorRampPalette(colors = colors)(100)
+
+my_breaks <- c(seq(-2, 0, length.out = ceiling(100 / 2) + 1),
+               seq(0.05, 2, length.out = floor(100 / 2)))
+
+# Plot
+pheatmap::pheatmap(mat = sample_acts_mat,
+                   color = colors.use,
+                   border_color = "white",
+                   breaks = my_breaks,
+                   cellwidth = 15,
+                   cellheight = 15,
+                   treeheight_row = 20,
+                   treeheight_col = 20)
+```
+
+Infer TF activities from the t-values of the DEGs between STEM and DIFF:
+
+```{r}
+# Filter top TFs in both signs
+f_contrast_acts <- res_ulm %>%
+                   dplyr::mutate(rnk = NA)
+
+msk <- f_contrast_acts$score > 0
+
+f_contrast_acts[msk, 'rnk'] <- rank(-f_contrast_acts[msk, 'score'])
+f_contrast_acts[!msk, 'rnk'] <- rank(-abs(f_contrast_acts[!msk, 'score']))
+
+tfs <- f_contrast_acts %>%
+       dplyr::arrange(rnk) %>%
+       head(n_tfs) %>%
+       dplyr::pull(source)
+
+f_contrast_acts <- f_contrast_acts %>%
+                   filter(source %in% tfs)
+
+colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu")[c(2, 10)])
+
+p <- ggplot2::ggplot(data = f_contrast_acts, 
+                     mapping = ggplot2::aes(x = stats::reorder(source, score), 
+                                            y = score)) + 
+     ggplot2::geom_bar(mapping = ggplot2::aes(fill = score),
+                       color = "black",
+                       stat = "identity") +
+     ggplot2::scale_fill_gradient2(low = colors[1], 
+                                   mid = "whitesmoke", 
+                                   high = colors[2], 
+                                   midpoint = 0) + 
+     ggplot2::theme_minimal() +
+     ggplot2::theme(axis.title = element_text(face = "bold", size = 12),
+              axis.text.x = ggplot2::element_text(angle = 45, 
+                                                  hjust = 1, 
+                                                  size = 10, 
+                                                  face = "bold"),
+              axis.text.y = ggplot2::element_text(size = 10, 
+                                                  face = "bold"),
+              panel.grid.major = element_blank(), 
+              panel.grid.minor = element_blank()) +
+     ggplot2::xlab("TFs")
+
+p
+
+```
+
+```{r}
+ggplot(TF_ulm_RAD52_DIFF,
+       aes(x = score,
+           y = reorder(source, score))) +
+    geom_col() +
+    theme_classic()
+```
+
+```{r}
+covered_targets <- regulons %>%
+  filter(target %in% rownames(mat)) %>%
+  count(tf)
+```
+
+
+## Test: common activated and repressed
+
+```{r}
+common_activated_DIFF_STEM <- intersect(shRAD52_DIFF.shNT_DIFF.activated.genes, shRAD52_STEM.shNT_STEM.activated.genes)
+common_repressed_DIFF_STEM <- intersect(shRAD52_DIFF.shNT_DIFF.repressed.genes, shRAD52_STEM.shNT_STEM.repressed.genes)
+```
+
+## Leading Edge genes (GSEA)
+
+Checking Leading Edge genes in the topTable df:
+
+```{r}
+# Function to extract the leading-edge genes of one geneset/pathway in a
+# fgsea contrast. It then creates a table with a description for each gene
+# in the leading-edge
+
+leading_edge_function <- function(fgsea_result, pathway, contrast, filename){
+  # See at which row the pathway is indexed and extract the leading-edge genes
+  geneset_index <- which(fgsea_result[,1] == pathway)
+  leading_edge <- fgsea_result[[geneset_index,8]]
+  
+  # Create the annotation (description) of each gene
+  annot <- queryMany(
+    leading_edge,
+    scopes = "symbol",
+    fields = c("name", "summary"),
+    species = "human")
+  
+  # Save the annotation as a .tsv table
+  annot <- data.frame(annot$query, annot$name, annot$summary)
+  write.table(x = annot, file = filename, quote = F,
+            row.names = F, sep = "\t")
+  
+  # Returns a table with the TopTable results of the leading-edge genes, so that
+  # we can easily check the p-values of those genes
+  return(contrast[leading_edge,])
+}
+
+leading_edge_function(fgsea_result = fgseaRes.shNT_STEM.shNT_DIFF,
+                      pathway = "HALLMARK_DNA_REPAIR",
+                      contrast = shNT_STEM.shNT_DIFF,
+                      filename = "leading_edge_STEMDIFF_DNA_REPAIR.tsv")
+```
+
+RAD52 vs NT, DIFF cells
+
+```{r}
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_DIFF.shNT_DIFF,
+                      pathway = "HALLMARK_HYPOXIA",
+                      contrast = shRAD52_DIFF.shNT_DIFF,
+                      filename = "leading_edge_RAD52DIFF_HYPOXIA.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_DIFF.shNT_DIFF,
+                      pathway = "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+                      contrast = shRAD52_DIFF.shNT_DIFF,
+                      filename = "leading_edge_RAD52DIFF_EMT.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_DIFF.shNT_DIFF,
+                      pathway = "HALLMARK_ANGIOGENESIS",
+                      contrast = shRAD52_DIFF.shNT_DIFF,
+                      filename = "leading_edge_RAD52DIFF_ANGIOGENESIS.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_DIFF.shNT_DIFF,
+                      pathway = "HALLMARK_UV_RESPONSE_UP",
+                      contrast = shRAD52_DIFF.shNT_DIFF,
+                      filename = "leading_edge_RAD52DIFF_UV_UP.tsv")
+
+## fry() identifies some pathways that fgesa() doesn't. Let's look at the genes
+## of those fry()-exclusive pathways
+
+p53_genes_RAD52DIFF <- na.omit(shRAD52_DIFF.shNT_DIFF[gene_sets[["HALLMARK_P53_PATHWAY"]],])
+p53_genes_RAD52DIFF[order(p53_genes_RAD52DIFF$P.Value),]
+
+mTOR_genes_RAD52DIFF <- na.omit(shRAD52_DIFF.shNT_DIFF[gene_sets[["HALLMARK_PI3K_AKT_MTOR_SIGNALING"]],])
+mTOR_genes_RAD52DIFF[order(mTOR_genes_RAD52DIFF$P.Value),]
+
+
+```
+
+RAD52 vs NT, STEM cells
+
+```{r}
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_EMT.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_ESTROGEN_RESPONSE_LATE",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_ESTROGEN.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_COAGULATION",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_COAGULATION.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_APOPTOSIS",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_APOPTOSIS.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_COMPLEMENT",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_COMPLEMENT.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_INFLAMMATORY_RESPONSE",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_INFLAMMATORY.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_PI3K_AKT_MTOR_SIGNALING",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_MTOR.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_UV_RESPONSE_UP",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_UV_UP.tsv")
+
+leading_edge_function(fgsea_result = fgseaRes.shRAD52_STEM.shNT_STEM,
+                      pathway = "HALLMARK_KRAS_SIGNALING_UP",
+                      contrast = shRAD52_STEM.shNT_STEM,
+                      filename = "leading_edge_RAD52STEM_KRAS.tsv")
+
+
+UV_UP_genes_RAD52STEM <- na.omit(shRAD52_STEM.shNT_STEM[gene_sets[["HALLMARK_UV_RESPONSE_UP"]],])
+UV_UP_genes_RAD52STEM[order(UV_UP_genes_RAD52STEM$P.Value),]
+
+DNAREPAIR_genes_RAD52STEM <- na.omit(shRAD52_STEM.shNT_STEM[gene_sets[["HALLMARK_DNA_REPAIR"]],])
+DNAREPAIR_genes_RAD52STEM[order(DNAREPAIR_genes_RAD52STEM$P.Value),]
+
+```
+
+### Heatmaps
+
+Heatmap of protein expression for the GSEA results
+
+```{r}
+heatmap_gsea <- function(pathway, protein_data, samples, image_name){
+  # Careful: requieres gene_sets to be defined before running the function.
+  # Gets the list of genes from the pathway and extracts the expression values
+  # from the protein data df
+  geneset_prots <- gene_sets[[pathway]]
+  # The input argument "samples" has to be a vector specifying the indexes of
+  # the samples we are mapping in the protein data df
+  protein_matrix <- na.omit(protein_data[geneset_prots, samples])
+  
+  # Draws and saves the heatmap as svg and jpg
+  heatmap <- pheatmap::pheatmap(mat = protein_matrix,
+                   scale = 'row', # To scale each protein individually, in case
+                                  # one has much higher expression than the rest
+                   color = colors.use,
+                   border_color = "white")
+  
+  ggplot2::ggsave(paste0(image_name,".svg"),
+                heatmap$gtable,
+                width = 8,
+                height = 20)
+
+  ggplot2::ggsave(paste0(image_name,".jpg"),
+                heatmap$gtable,
+                width = 8,
+                height = 20,
+                dpi = 300)
+}
+
+# The same function, but only representing the leading edge genes of the pathway
+
+heatmap_gsea_leading <- function(pathway, protein_data, samples, image_name, fgsea_result){
+  # Careful: requieres gene_sets to be defined before running the function.
+  # Gets the list of genes from the pathway and extracts the expression values
+  # from the protein data df
+  geneset_index <- which(fgsea_result[,1] == pathway)
+  leading_edge <- fgsea_result[[geneset_index,8]]
+
+  # The input argument "samples" has to be a vector specifying the indexes of
+  # the samples we are mapping in the protein data df
+  protein_matrix <- na.omit(protein_data[leading_edge, samples])
+  
+  # Draws and saves the heatmap as svg and jpg
+  heatmap <- pheatmap::pheatmap(mat = protein_matrix,
+                   scale = 'row', # To scale each protein individually, in case
+                                  # one has much higher expression than the rest
+                   color = colors.use,
+                   border_color = "white")
+  
+  ggplot2::ggsave(paste0(image_name,".svg"),
+                heatmap$gtable,
+                width = 8,
+                height = 20)
+
+  ggplot2::ggsave(paste0(image_name,".jpg"),
+                heatmap$gtable,
+                width = 8,
+                height = 20,
+                dpi = 300)
+}
+
+heatmap_gsea(pathway = "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+             protein_data = normalized_protein,
+             samples = c(1:8),
+             image_name = "heatmap_STEMDIFF_EMT")
+
+heatmap_gsea(pathway = "HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+             protein_data = normalized_protein,
+             samples = c(1:8),
+             image_name = "heatmap_STEMDIFF_OXPHOS")
+
+heatmap_gsea(pathway = "HALLMARK_DNA_REPAIR",
+             protein_data = normalized_protein,
+             samples = c(1:8),
+             image_name = "heatmap_STEMDIFF_DNAREPAIR")
+
+heatmap_gsea_leading(pathway = "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+             protein_data = normalized_protein,
+             samples = c(1:8),
+             image_name = "heatmap_STEMDIFF_EMT_leading",
+             fgsea_result = fgseaRes.shNT_STEM.shNT_DIFF)
+
+heatmap_gsea_leading(pathway = "HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+             protein_data = normalized_protein,
+             samples = c(1:8),
+             image_name = "heatmap_STEMDIFF_OXPHOS_leading",
+             fgsea_result = fgseaRes.shNT_STEM.shNT_DIFF)
+
+heatmap_gsea_leading(pathway = "HALLMARK_DNA_REPAIR",
+             protein_data = normalized_protein,
+             samples = c(1:8),
+             image_name = "heatmap_STEMDIFF_DNAREPAIR_leading",
+             fgsea_result = fgseaRes.shNT_STEM.shNT_DIFF)
+```
+
+Heatmap of protein expression for the OXPHOS proteins
+
+```{r}
+# OXPHOS_prots <- pathway_contrast
+# OXPHOS_prots_pval <- OXPHOS_prots$P.Value
+
+# OXPHOS_prots <- gene_sets[["HALLMARK_OXIDATIVE_PHOSPHORYLATION"]]
+
+OXPHOS_prots <- fgseaRes.shNT_STEM.shNT_DIFF[[36,8]]
+OXPHOS_prots <- shNT_STEM.shNT_DIFF[OXPHOS_prots,]
+# OXPHOS_prots_padj <- OXPHOS_prots$adj.P.Val
+# OXPHOS_prots <- OXPHOS_prots[OXPHOS_prots_padj < 0.05,]
+OXPHOS_prots <- rownames(OXPHOS_prots)
+
+OXPHOS_matrix <- na.omit(normalized_protein[OXPHOS_prots,c(1:8)])
+
+svg("heatmap_OXPHOS.svg", width = 8, height = 16)
+# jpeg("heatmap_OXPHOS.jpg", width = 1600, height = 3200, res = 300)
+pheatmap::pheatmap(mat = OXPHOS_matrix,
+                   scale = 'row', # To scale each protein individually, in case
+                                  # one has much higher expression than the rest
+                   color = colors.use,
+                   border_color = "white",
+                   # cellwidth = 15,
+                   # cellheight = 15,
+                   # treeheight_row = 20,
+                   # treeheight_col = 20
+                   )
+dev.off()
+```
+
+```{r}
+thap11_prots <- thap11_targets$target
+thap11_matrix <- na.omit(normalized_prot_DIFF[thap11_prots,])
+
+pheatmap::pheatmap(mat = thap11_matrix,
+                   scale = 'row', # To scale each protein individually, in case
+                                  # one has much higher expression than the rest
+                   color = colors.use,
+                   border_color = "white",
+                   # cellwidth = 15,
+                   # cellheight = 15,
+                   # treeheight_row = 20,
+                   # treeheight_col = 20
+                   )
+```
